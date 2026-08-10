@@ -1,0 +1,23 @@
+# Broken Link Checker - Apache Configuration
+
+# Protect sensitive directories
+RewriteEngine On
+
+# Block access to data directory
+RewriteRule ^data/ - [F,L]
+
+# Block access to internal PHP directories
+RewriteRule ^classes/ - [F,L]
+RewriteRule ^includes/ - [F,L]
+RewriteRule ^config/ - [F,L]
+RewriteRule ^migrations/ - [F,L]
+RewriteRule ^cron/ - [F,L]
+RewriteRule ^templates/ - [F,L]
+
+# Block access to hidden files
+RewriteRule (^\.|/\.) - [F,L]
+
+# Block access to SQL and log files
+<FilesMatch "\.(sql|db|db-wal|db-shm|log)$">
+    Require all denied
+</FilesMatch>
