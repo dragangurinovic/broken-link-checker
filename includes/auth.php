@@ -4,15 +4,24 @@
  * Verifies the visitor is a logged-in WordPress administrator
  */
 
-require_once __DIR__ . '/../config/config.php';
+if (!defined('BLC_ROOT')) {
+    define('BLC_ROOT', dirname(__DIR__));
+}
+require_once BLC_ROOT . '/config/config.php';
 
 function blc_check_auth(): array {
+    // If WordPress is already loaded (e.g., from index.php routing through WP),
+    // skip re-loading wp-load.php
+    if (function_exists('is_user_logged_in')) {
+        return blc_validate_wp_user();
+    }
+
     $wpLoadPath = BLC_WP_PATH . '/wp-load.php';
 
     if (!file_exists($wpLoadPath)) {
         return [
             'authenticated' => false,
-            'error' => 'WordPress installation not found at: ' . BLC_WP_PATH,
+            'error' => 'WordPress not found at: ' . BLC_WP_PATH . ' — update BLC_WP_PATH in config/config.php',
         ];
     }
 
@@ -20,7 +29,6 @@ function blc_check_auth(): array {
         define('ABSPATH', BLC_WP_PATH . '/');
     }
 
-    // Suppress any output from WordPress loading
     ob_start();
     try {
         require_once $wpLoadPath;
@@ -32,6 +40,11 @@ function blc_check_auth(): array {
         ];
     }
     ob_end_clean();
+
+    return blc_validate_wp_user();
+}
+
+function blc_validate_wp_user(): array {
 
     if (!function_exists('is_user_logged_in') || !is_user_logged_in()) {
         return [

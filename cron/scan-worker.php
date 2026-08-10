@@ -34,23 +34,10 @@ blc_log("Worker: Starting scan for site ID {$siteId}" . ($scanId ? " (scan #{$sc
 Database::runMigrations();
 $db = Database::getInstance();
 
-// If scan-id was passed, update the existing record to 'running'
-if ($scanId > 0) {
-    $stmt = $db->prepare("UPDATE scans SET status = 'running', started_at = datetime('now') WHERE id = ? AND status = 'pending'");
-    $stmt->execute([$scanId]);
-}
-
 try {
     $scanner = new Scanner($db, $siteId);
-
-    // If we have an existing scan ID, use it; otherwise run() will create one
-    if ($scanId > 0) {
-        // We need to set the scan ID in the scanner
-        // The Scanner class creates its own, so we need to update it
-        $resultScanId = $scanner->run($scanId > 0 ? 'manual' : 'scheduled');
-    } else {
-        $resultScanId = $scanner->run('scheduled');
-    }
+    $triggerType = $scanId > 0 ? 'manual' : 'scheduled';
+    $resultScanId = $scanner->run($triggerType, $scanId > 0 ? $scanId : null);
 
     blc_log("Worker: Scan #{$resultScanId} completed for site ID {$siteId}");
 } catch (\Throwable $e) {

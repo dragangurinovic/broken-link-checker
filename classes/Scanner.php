@@ -76,18 +76,22 @@ class Scanner {
         return false;
     }
 
-    public function run(string $triggerType = 'manual'): int {
-        // Check for already running scan
-        $stmt = $this->db->prepare("SELECT COUNT(*) FROM scans WHERE site_id = ? AND status = 'running'");
-        $stmt->execute([$this->siteId]);
-        if ($stmt->fetchColumn() > 0) {
-            throw new RuntimeException("A scan is already running for this site");
-        }
+    public function run(string $triggerType = 'manual', ?int $existingScanId = null): int {
+        if ($existingScanId) {
+            $this->scanId = $existingScanId;
+            $stmt = $this->db->prepare("UPDATE scans SET status = 'running', started_at = datetime('now') WHERE id = ?");
+            $stmt->execute([$this->scanId]);
+        } else {
+            $stmt = $this->db->prepare("SELECT COUNT(*) FROM scans WHERE site_id = ? AND status = 'running'");
+            $stmt->execute([$this->siteId]);
+            if ($stmt->fetchColumn() > 0) {
+                throw new RuntimeException("A scan is already running for this site");
+            }
 
-        // Create scan record
-        $stmt = $this->db->prepare("INSERT INTO scans (site_id, status, trigger_type, started_at) VALUES (?, 'running', ?, datetime('now'))");
-        $stmt->execute([$this->siteId, $triggerType]);
-        $this->scanId = (int) $this->db->lastInsertId();
+            $stmt = $this->db->prepare("INSERT INTO scans (site_id, status, trigger_type, started_at) VALUES (?, 'running', ?, datetime('now'))");
+            $stmt->execute([$this->siteId, $triggerType]);
+            $this->scanId = (int) $this->db->lastInsertId();
+        }
 
         $this->log('info', "Starting scan for {$this->site['name']} ({$this->site['url']})");
 
