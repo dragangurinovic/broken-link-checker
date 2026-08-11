@@ -267,7 +267,8 @@ $scanHistory = $scanHistory->fetchAll();
                                 <div class="dropdown">
                                     <button class="btn btn-outline btn-sm btn-icon dropdown-toggle" title="Actions">&#8943;</button>
                                     <div class="dropdown-menu">
-                                        <button class="dropdown-item" onclick="BLC.recheckLink(<?= $link['id'] ?>).then(() => location.reload())">Recheck</button>
+                                        <button class="dropdown-item" onclick="BLC.recheckLink(<?= $link['id'] ?>).then(() => location.reload())">Recheck Link</button>
+                                        <button class="dropdown-item" onclick="BLC.rescanPage('<?= htmlspecialchars(addslashes($link['source_url'])) ?>', <?= $siteId ?>).then(() => location.reload())">Re-scan Page</button>
                                         <button class="dropdown-item" onclick="BLC.showIgnoreDialog('<?= htmlspecialchars(addslashes($link['target_url'])) ?>', <?= $siteId ?>)">Ignore</button>
                                         <a class="dropdown-item" href="<?= htmlspecialchars($link['target_url']) ?>" target="_blank">Open Link</a>
                                         <a class="dropdown-item" href="<?= htmlspecialchars($link['source_url']) ?>" target="_blank">Open Source Page</a>

@@ -31,6 +31,9 @@ if (!$site) {
     blc_json_response(['error' => 'Site not found'], 404);
 }
 
+// Auto-expire scans stuck in running/pending for more than 30 minutes
+$db->prepare("UPDATE scans SET status = 'failed', error_message = 'Timed out (stuck)', completed_at = datetime('now') WHERE site_id = ? AND status IN ('running', 'pending') AND started_at < datetime('now', '-30 minutes')")->execute([$siteId]);
+
 $stmt = $db->prepare("SELECT id FROM scans WHERE site_id = ? AND status IN ('running', 'pending')");
 $stmt->execute([$siteId]);
 if ($stmt->fetch()) {

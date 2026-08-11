@@ -180,6 +180,25 @@ const BLC = {
         }
     },
 
+    async rescanPage(sourceUrl, siteId) {
+        try {
+            this.toast('Re-scanning page...', 'info');
+            const data = await this.fetch('rescan-page.php', {
+                method: 'POST',
+                body: JSON.stringify({ source_url: sourceUrl, site_id: siteId }),
+            });
+            const parts = [];
+            if (data.removed > 0) parts.push(`${data.removed} removed`);
+            if (data.added > 0) parts.push(`${data.added} new`);
+            if (data.rechecked > 0) parts.push(`${data.rechecked} rechecked`);
+            this.toast('Page re-scanned: ' + (parts.length ? parts.join(', ') : 'no changes'), 'success');
+            return data;
+        } catch (err) {
+            this.toast('Re-scan failed: ' + err.message, 'error');
+            return null;
+        }
+    },
+
     async recheckLink(linkId) {
         try {
             const data = await this.fetch('recheck.php', {
