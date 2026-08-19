@@ -10,6 +10,7 @@ require_once __DIR__ . '/UserAgentRotator.php';
 require_once __DIR__ . '/BlockDetector.php';
 require_once __DIR__ . '/HealthScore.php';
 require_once __DIR__ . '/Notifier.php';
+require_once __DIR__ . '/WpDatabaseReader.php';
 
 class Scanner {
     private PDO $db;
@@ -96,7 +97,11 @@ class Scanner {
         $this->log('info', "Starting scan for {$this->site['name']} ({$this->site['url']})");
 
         try {
-            $this->crawl();
+            if ($this->site['scan_mode'] === 'database' && $this->site['is_wordpress'] && !empty($this->site['wp_db_name'])) {
+                $this->crawlFromDatabase();
+            } else {
+                $this->crawl();
+            }
             $this->finalizeScan('completed');
         } catch (\Throwable $e) {
             $this->log('error', "Scan failed: " . $e->getMessage());
@@ -158,9 +163,7 @@ class Scanner {
             $this->rateLimiter->recordRequest($domain);
 
             // Save page
-            $stmt = $this->db->prepare('INSERT INTO pages (scan_id, site_id, url, http_status, content_type, response_time_ms, crawl_depth) VALUES (?, ?, ?, ?, ?, ?, ?)');
-            $stmt->execute([$this->scanId, $this->siteId, $url, $httpStatus ?: null, $contentType, $responseTime, $depth]);
-            $pageId = (int) $this->db->lastInsertId();
+            $pageId = $this->savePageRecord($url, $httpStatus ?: 0, $contentType, $responseTime, $depth);
 
             $pagesProcessed++;
             $this->updateProgress($pagesProcessed);
@@ -196,48 +199,12 @@ class Scanner {
                 // Skip external if not checking
                 if (!$isInternal && !$this->site['crawl_external']) continue;
 
-                // Check if already checked this target in this scan
                 if (isset($this->checkedTargets[$targetUrl])) {
-                    // Still record the link occurrence
-                    $linksBuffer[] = [
-                        'scan_id' => $this->scanId,
-                        'site_id' => $this->siteId,
-                        'source_page_id' => $pageId,
-                        'source_url' => $url,
-                        'target_url' => $targetUrl,
-                        'link_text' => $link['text'],
-                        'link_type' => $link['type'],
-                        'is_internal' => $isInternal ? 1 : 0,
-                        'status_category' => $this->checkedTargets[$targetUrl]['status_category'],
-                        'http_status' => $this->checkedTargets[$targetUrl]['http_status'],
-                        'response_time_ms' => $this->checkedTargets[$targetUrl]['response_time_ms'],
-                        'final_url' => $this->checkedTargets[$targetUrl]['final_url'],
-                        'redirect_count' => $this->checkedTargets[$targetUrl]['redirect_count'],
-                        'block_type' => $this->checkedTargets[$targetUrl]['block_type'],
-                        'error_message' => $this->checkedTargets[$targetUrl]['error_message'],
-                    ];
+                    $linksBuffer[] = $this->buildLinkRecord($pageId, $url, $targetUrl, $link, $isInternal, $this->checkedTargets[$targetUrl]);
                 } else {
-                    // Check the link
                     $linkResult = $this->checkLink($targetUrl, $link['type']);
                     $this->checkedTargets[$targetUrl] = $linkResult;
-
-                    $linksBuffer[] = [
-                        'scan_id' => $this->scanId,
-                        'site_id' => $this->siteId,
-                        'source_page_id' => $pageId,
-                        'source_url' => $url,
-                        'target_url' => $targetUrl,
-                        'link_text' => $link['text'],
-                        'link_type' => $link['type'],
-                        'is_internal' => $isInternal ? 1 : 0,
-                        'status_category' => $linkResult['status_category'],
-                        'http_status' => $linkResult['http_status'],
-                        'response_time_ms' => $linkResult['response_time_ms'],
-                        'final_url' => $linkResult['final_url'],
-                        'redirect_count' => $linkResult['redirect_count'],
-                        'block_type' => $linkResult['block_type'],
-                        'error_message' => $linkResult['error_message'],
-                    ];
+                    $linksBuffer[] = $this->buildLinkRecord($pageId, $url, $targetUrl, $link, $isInternal, $linkResult);
                 }
 
                 // Flush buffer
@@ -261,6 +228,149 @@ class Scanner {
         if (!empty($linksBuffer)) {
             $this->flushLinks($linksBuffer);
         }
+    }
+
+    private function crawlFromDatabase(): void {
+        $wpReader = new WpDatabaseReader($this->site);
+        $totalPosts = $wpReader->countPublished();
+        $this->log('info', "Direct DB mode: {$totalPosts} published posts/pages to process");
+
+        $stmt = $this->db->prepare("UPDATE scans SET pages_total = ? WHERE id = ?");
+        $stmt->execute([$totalPosts, $this->scanId]);
+
+        $siteDomain = blc_get_domain($this->site['url']);
+        $batchSize = 100;
+        $pagesProcessed = 0;
+        $linksBuffer = [];
+        $offset = 0;
+
+        while (!$this->cancelled) {
+            $posts = $wpReader->getPublishedContent($batchSize, $offset);
+            if (empty($posts)) break;
+            $offset += $batchSize;
+
+            foreach ($posts as $post) {
+                if ($this->cancelled) break;
+
+                $pageUrl = $wpReader->getPermalink($post);
+                if (isset($this->visitedUrls[$pageUrl])) continue;
+                $this->visitedUrls[$pageUrl] = true;
+
+                $pageId = $this->savePageRecord($pageUrl, 200, 'text/html', 0, 0);
+                $pagesProcessed++;
+                $this->updateProgress($pagesProcessed);
+
+                $html = $wpReader->wrapContent($post['post_content']);
+                $extractedLinks = LinkExtractor::extract($html, $pageUrl, [
+                    'check_images' => (bool) $this->site['check_images'],
+                    'check_youtube' => (bool) $this->site['check_youtube'],
+                ]);
+
+                foreach ($extractedLinks as $link) {
+                    $targetUrl = $link['url'];
+                    if (empty($targetUrl)) continue;
+
+                    $isInternal = $this->isInternalUrl($targetUrl, $siteDomain);
+                    if (!$isInternal && !$this->site['crawl_external']) continue;
+
+                    if (isset($this->checkedTargets[$targetUrl])) {
+                        $linksBuffer[] = $this->buildLinkRecord($pageId, $pageUrl, $targetUrl, $link, $isInternal, $this->checkedTargets[$targetUrl]);
+                    } else {
+                        $linkResult = $isInternal
+                            ? $this->checkInternalLinkViaDb($targetUrl, $wpReader)
+                            : $this->checkLink($targetUrl, $link['type']);
+                        $this->checkedTargets[$targetUrl] = $linkResult;
+                        $linksBuffer[] = $this->buildLinkRecord($pageId, $pageUrl, $targetUrl, $link, $isInternal, $linkResult);
+                    }
+
+                    if (count($linksBuffer) >= 50) {
+                        $this->flushLinks($linksBuffer);
+                        $linksBuffer = [];
+                    }
+                }
+
+                // Check for cancellation every 50 pages
+                if ($pagesProcessed % 50 === 0) {
+                    $stmt = $this->db->prepare("SELECT status FROM scans WHERE id = ?");
+                    $stmt->execute([$this->scanId]);
+                    if ($stmt->fetchColumn() === 'cancelled') {
+                        $this->cancelled = true;
+                        $this->log('info', 'Scan cancelled by user');
+                    }
+                }
+            }
+        }
+
+        if (!empty($linksBuffer)) {
+            $this->flushLinks($linksBuffer);
+        }
+    }
+
+    private function checkInternalLinkViaDb(string $url, WpDatabaseReader $wpReader): array {
+        if ($this->isIgnored($url)) {
+            return ['http_status' => null, 'status_category' => 'ignored', 'response_time_ms' => null, 'final_url' => null, 'redirect_count' => 0, 'block_type' => null, 'error_message' => 'Ignored by rule'];
+        }
+
+        // For internal links, do a lightweight HEAD request instead of a full GET.
+        // This is still HTTP but avoids rendering the full page — just checks existence.
+        $headers = $this->uaRotator->getHeaders(false);
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_NOBODY => true,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS => 5,
+            CURLOPT_TIMEOUT => 10,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_HTTPHEADER => $headers,
+        ]);
+
+        curl_exec($ch);
+        $httpStatus = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+        $responseTime = (int) (curl_getinfo($ch, CURLINFO_TOTAL_TIME) * 1000);
+        $error = curl_error($ch);
+        $redirectCount = (int) curl_getinfo($ch, CURLINFO_REDIRECT_COUNT);
+        curl_close($ch);
+
+        if ($httpStatus === 0) {
+            return ['http_status' => null, 'status_category' => 'broken', 'response_time_ms' => $responseTime, 'final_url' => $finalUrl, 'redirect_count' => $redirectCount, 'block_type' => null, 'error_message' => $error ?: 'Connection failed'];
+        }
+        if ($httpStatus >= 400) {
+            return ['http_status' => $httpStatus, 'status_category' => 'broken', 'response_time_ms' => $responseTime, 'final_url' => $finalUrl, 'redirect_count' => $redirectCount, 'block_type' => null, 'error_message' => null];
+        }
+        if ($httpStatus >= 300) {
+            return ['http_status' => $httpStatus, 'status_category' => 'warning', 'response_time_ms' => $responseTime, 'final_url' => $finalUrl, 'redirect_count' => $redirectCount, 'block_type' => null, 'error_message' => null];
+        }
+        return ['http_status' => $httpStatus, 'status_category' => 'ok', 'response_time_ms' => $responseTime, 'final_url' => $finalUrl, 'redirect_count' => $redirectCount, 'block_type' => null, 'error_message' => null];
+    }
+
+    private function savePageRecord(string $url, int $httpStatus, string $contentType, int $responseTime, int $depth): int {
+        $stmt = $this->db->prepare('INSERT INTO pages (scan_id, site_id, url, http_status, content_type, response_time_ms, crawl_depth) VALUES (?, ?, ?, ?, ?, ?, ?)');
+        $stmt->execute([$this->scanId, $this->siteId, $url, $httpStatus, $contentType, $responseTime, $depth]);
+        return (int) $this->db->lastInsertId();
+    }
+
+    private function buildLinkRecord(int $pageId, string $pageUrl, string $targetUrl, array $link, bool $isInternal, array $result): array {
+        return [
+            'scan_id' => $this->scanId,
+            'site_id' => $this->siteId,
+            'source_page_id' => $pageId,
+            'source_url' => $pageUrl,
+            'target_url' => $targetUrl,
+            'link_text' => $link['text'],
+            'link_type' => $link['type'],
+            'is_internal' => $isInternal ? 1 : 0,
+            'status_category' => $result['status_category'],
+            'http_status' => $result['http_status'],
+            'response_time_ms' => $result['response_time_ms'],
+            'final_url' => $result['final_url'],
+            'redirect_count' => $result['redirect_count'],
+            'block_type' => $result['block_type'],
+            'error_message' => $result['error_message'],
+        ];
     }
 
     private function checkLink(string $url, string $type): array {

@@ -63,6 +63,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    // Save WordPress database config per site
+    if (isset($_POST['wpdb'])) {
+        foreach ($_POST['wpdb'] as $siteId => $wpdb) {
+            $scanMode = ($wpdb['scan_mode'] ?? 'http') === 'database' ? 'database' : 'http';
+            $stmt = $db->prepare('UPDATE sites SET scan_mode = ?, wp_db_host = ?, wp_db_name = ?, wp_db_user = ?, wp_db_pass = ?, wp_table_prefix = ? WHERE id = ?');
+            $stmt->execute([
+                $scanMode,
+                trim($wpdb['host'] ?? '') ?: 'localhost',
+                trim($wpdb['name'] ?? ''),
+                trim($wpdb['user'] ?? ''),
+                $wpdb['pass'] ?? '',
+                trim($wpdb['prefix'] ?? '') ?: 'wp_',
+                $siteId,
+            ]);
+        }
+    }
+
     $_SESSION['flash_message'] = 'Settings saved successfully!';
     $_SESSION['flash_type'] = 'success';
     header('Location: index.php?page=settings');
@@ -235,6 +252,59 @@ $sites = $db->query("SELECT s.*, ss.frequency, ss.day_of_week, ss.day_of_month, 
         </div>
     </div>
 
+    <!-- WordPress Direct DB Scan -->
+    <?php $wpSites = array_filter($sites, fn($s) => $s['is_wordpress']); ?>
+    <?php if (!empty($wpSites)): ?>
+    <div class="card" style="margin-bottom: 24px;">
+        <div class="card-header"><h3>WordPress Direct Database Scan</h3></div>
+        <div class="card-body">
+            <p style="font-size: 13px; color: var(--gray-600); margin-bottom: 16px;">
+                For WordPress sites on this server, scanning directly from the database is much faster and puts zero load on Apache.
+                Instead of HTTP-crawling thousands of pages, it reads post content from MySQL and only makes HTTP requests to verify external links.
+            </p>
+            <?php foreach ($wpSites as $wpSite): ?>
+            <div style="border: 1px solid var(--gray-200); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
+                <h4 style="font-size: 14px; font-weight: 600; margin-bottom: 12px;"><?= htmlspecialchars($wpSite['name']) ?></h4>
+                <div class="settings-grid">
+                    <div class="form-group">
+                        <label class="form-label">Scan Mode</label>
+                        <select name="wpdb[<?= $wpSite['id'] ?>][scan_mode]" class="form-control" style="width:auto;">
+                            <option value="http" <?= ($wpSite['scan_mode'] ?? 'http') === 'http' ? 'selected' : '' ?>>HTTP Crawl (default)</option>
+                            <option value="database" <?= ($wpSite['scan_mode'] ?? 'http') === 'database' ? 'selected' : '' ?>>Direct Database</option>
+                        </select>
+                        <div class="form-hint">Direct Database is recommended for local WP sites</div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">DB Host</label>
+                        <input type="text" name="wpdb[<?= $wpSite['id'] ?>][host]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_db_host'] ?? 'localhost') ?>" placeholder="localhost">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">DB Name</label>
+                        <input type="text" name="wpdb[<?= $wpSite['id'] ?>][name]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_db_name'] ?? '') ?>" placeholder="wp_database">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">DB User</label>
+                        <input type="text" name="wpdb[<?= $wpSite['id'] ?>][user]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_db_user'] ?? '') ?>" placeholder="wp_user">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">DB Password</label>
+                        <input type="password" name="wpdb[<?= $wpSite['id'] ?>][pass]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_db_pass'] ?? '') ?>" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Table Prefix</label>
+                        <input type="text" name="wpdb[<?= $wpSite['id'] ?>][prefix]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_table_prefix'] ?? 'wp_') ?>" placeholder="wp_">
+                    </div>
+                </div>
+                <div style="margin-top: 8px;">
+                    <button type="button" class="btn btn-outline btn-sm" onclick="testWpDb(<?= $wpSite['id'] ?>)">Test Connection</button>
+                    <span id="wpdb-result-<?= $wpSite['id'] ?>" style="margin-left: 8px; font-size: 12px;"></span>
+                </div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+    </div>
+    <?php endif; ?>
+
     <div class="card" style="margin-bottom: 24px;">
         <div class="card-header"><h3>Cron Setup</h3></div>
         <div class="card-body">
@@ -246,3 +316,40 @@ $sites = $db->query("SELECT s.*, ss.frequency, ss.day_of_week, ss.day_of_month, 
 
     <button type="submit" class="btn btn-primary" style="margin-bottom: 24px;">Save Settings</button>
 </form>
+
+<script>
+function testWpDb(siteId) {
+    const form = document.querySelector('form');
+    const formData = new FormData(form);
+    const config = {
+        host: formData.get(`wpdb[${siteId}][host]`) || 'localhost',
+        name: formData.get(`wpdb[${siteId}][name]`),
+        user: formData.get(`wpdb[${siteId}][user]`),
+        pass: formData.get(`wpdb[${siteId}][pass]`),
+        prefix: formData.get(`wpdb[${siteId}][prefix]`) || 'wp_',
+    };
+    const el = document.getElementById(`wpdb-result-${siteId}`);
+    el.textContent = 'Testing...';
+    el.style.color = 'var(--gray-500)';
+
+    fetch('api/test-wp-db.php', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({site_id: siteId, ...config}),
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.success) {
+            el.textContent = `Connected! ${data.post_count} published posts found.`;
+            el.style.color = 'var(--success)';
+        } else {
+            el.textContent = `Failed: ${data.error}`;
+            el.style.color = 'var(--danger)';
+        }
+    })
+    .catch(err => {
+        el.textContent = `Error: ${err.message}`;
+        el.style.color = 'var(--danger)';
+    });
+}
+</script>
