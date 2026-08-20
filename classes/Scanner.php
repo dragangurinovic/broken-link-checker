@@ -97,7 +97,7 @@ class Scanner {
         $this->log('info', "Starting scan for {$this->site['name']} ({$this->site['url']})");
 
         try {
-            if ($this->site['scan_mode'] === 'database' && $this->site['is_wordpress'] && !empty($this->site['wp_db_name'])) {
+            if (!empty($this->site['wp_db_name']) && !empty($this->site['wp_db_user'])) {
                 $this->crawlFromDatabase();
             } else {
                 $this->crawl();

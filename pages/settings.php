@@ -63,16 +63,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // Save WordPress database config per site
+    // Save database config per site
     if (isset($_POST['wpdb'])) {
         foreach ($_POST['wpdb'] as $siteId => $wpdb) {
-            $scanMode = ($wpdb['scan_mode'] ?? 'http') === 'database' ? 'database' : 'http';
+            $dbName = trim($wpdb['name'] ?? '');
+            $dbUser = trim($wpdb['user'] ?? '');
+            $scanMode = (!empty($dbName) && !empty($dbUser)) ? 'database' : 'http';
             $stmt = $db->prepare('UPDATE sites SET scan_mode = ?, wp_db_host = ?, wp_db_name = ?, wp_db_user = ?, wp_db_pass = ?, wp_table_prefix = ? WHERE id = ?');
             $stmt->execute([
                 $scanMode,
                 trim($wpdb['host'] ?? '') ?: 'localhost',
-                trim($wpdb['name'] ?? ''),
-                trim($wpdb['user'] ?? ''),
+                $dbName,
+                $dbUser,
                 $wpdb['pass'] ?? '',
                 trim($wpdb['prefix'] ?? '') ?: 'wp_',
                 $siteId,
@@ -252,58 +254,54 @@ $sites = $db->query("SELECT s.*, ss.frequency, ss.day_of_week, ss.day_of_month, 
         </div>
     </div>
 
-    <!-- WordPress Direct DB Scan -->
-    <?php $wpSites = array_filter($sites, fn($s) => $s['is_wordpress']); ?>
-    <?php if (!empty($wpSites)): ?>
+    <!-- Direct Database Scan -->
     <div class="card" style="margin-bottom: 24px;">
-        <div class="card-header"><h3>WordPress Direct Database Scan</h3></div>
+        <div class="card-header"><h3>Direct Database Scan</h3></div>
         <div class="card-body">
             <p style="font-size: 13px; color: var(--gray-600); margin-bottom: 16px;">
-                For WordPress sites on this server, scanning directly from the database is much faster and puts zero load on Apache.
-                Instead of HTTP-crawling thousands of pages, it reads post content from MySQL and only makes HTTP requests to verify external links.
+                For WordPress sites on this server, you can scan directly from the database instead of HTTP-crawling.
+                This is much faster and puts zero load on Apache. Fill in the database credentials for any site to enable it — leave empty to use HTTP crawl.
             </p>
-            <?php foreach ($wpSites as $wpSite): ?>
+            <?php foreach ($sites as $s): ?>
             <div style="border: 1px solid var(--gray-200); border-radius: 8px; padding: 16px; margin-bottom: 16px;">
-                <h4 style="font-size: 14px; font-weight: 600; margin-bottom: 12px;"><?= htmlspecialchars($wpSite['name']) ?></h4>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                    <h4 style="font-size: 14px; font-weight: 600; margin: 0;"><?= htmlspecialchars($s['name']) ?></h4>
+                    <?php if (!empty($s['wp_db_name']) && !empty($s['wp_db_user'])): ?>
+                        <span class="badge badge-success" style="font-size: 11px;">Database mode</span>
+                    <?php else: ?>
+                        <span class="badge badge-light" style="font-size: 11px;">HTTP crawl</span>
+                    <?php endif; ?>
+                </div>
                 <div class="settings-grid">
                     <div class="form-group">
-                        <label class="form-label">Scan Mode</label>
-                        <select name="wpdb[<?= $wpSite['id'] ?>][scan_mode]" class="form-control" style="width:auto;">
-                            <option value="http" <?= ($wpSite['scan_mode'] ?? 'http') === 'http' ? 'selected' : '' ?>>HTTP Crawl (default)</option>
-                            <option value="database" <?= ($wpSite['scan_mode'] ?? 'http') === 'database' ? 'selected' : '' ?>>Direct Database</option>
-                        </select>
-                        <div class="form-hint">Direct Database is recommended for local WP sites</div>
-                    </div>
-                    <div class="form-group">
                         <label class="form-label">DB Host</label>
-                        <input type="text" name="wpdb[<?= $wpSite['id'] ?>][host]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_db_host'] ?? 'localhost') ?>" placeholder="localhost">
+                        <input type="text" name="wpdb[<?= $s['id'] ?>][host]" class="form-control" value="<?= htmlspecialchars($s['wp_db_host'] ?? 'localhost') ?>" placeholder="localhost">
                     </div>
                     <div class="form-group">
                         <label class="form-label">DB Name</label>
-                        <input type="text" name="wpdb[<?= $wpSite['id'] ?>][name]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_db_name'] ?? '') ?>" placeholder="wp_database">
+                        <input type="text" name="wpdb[<?= $s['id'] ?>][name]" class="form-control" value="<?= htmlspecialchars($s['wp_db_name'] ?? '') ?>" placeholder="wp_database">
                     </div>
                     <div class="form-group">
                         <label class="form-label">DB User</label>
-                        <input type="text" name="wpdb[<?= $wpSite['id'] ?>][user]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_db_user'] ?? '') ?>" placeholder="wp_user">
+                        <input type="text" name="wpdb[<?= $s['id'] ?>][user]" class="form-control" value="<?= htmlspecialchars($s['wp_db_user'] ?? '') ?>" placeholder="wp_user">
                     </div>
                     <div class="form-group">
                         <label class="form-label">DB Password</label>
-                        <input type="password" name="wpdb[<?= $wpSite['id'] ?>][pass]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_db_pass'] ?? '') ?>" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
+                        <input type="password" name="wpdb[<?= $s['id'] ?>][pass]" class="form-control" value="<?= htmlspecialchars($s['wp_db_pass'] ?? '') ?>" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;">
                     </div>
                     <div class="form-group">
                         <label class="form-label">Table Prefix</label>
-                        <input type="text" name="wpdb[<?= $wpSite['id'] ?>][prefix]" class="form-control" value="<?= htmlspecialchars($wpSite['wp_table_prefix'] ?? 'wp_') ?>" placeholder="wp_">
+                        <input type="text" name="wpdb[<?= $s['id'] ?>][prefix]" class="form-control" value="<?= htmlspecialchars($s['wp_table_prefix'] ?? 'wp_') ?>" placeholder="wp_">
                     </div>
                 </div>
                 <div style="margin-top: 8px;">
-                    <button type="button" class="btn btn-outline btn-sm" onclick="testWpDb(<?= $wpSite['id'] ?>)">Test Connection</button>
-                    <span id="wpdb-result-<?= $wpSite['id'] ?>" style="margin-left: 8px; font-size: 12px;"></span>
+                    <button type="button" class="btn btn-outline btn-sm" onclick="testWpDb(<?= $s['id'] ?>)">Test Connection</button>
+                    <span id="wpdb-result-<?= $s['id'] ?>" style="margin-left: 8px; font-size: 12px;"></span>
                 </div>
             </div>
             <?php endforeach; ?>
         </div>
     </div>
-    <?php endif; ?>
 
     <div class="card" style="margin-bottom: 24px;">
         <div class="card-header"><h3>Cron Setup</h3></div>
