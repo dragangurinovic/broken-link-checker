@@ -255,57 +255,62 @@ class Scanner {
             if (empty($posts)) break;
             $offset += $batchSize;
 
-            foreach ($posts as $post) {
-                if ($this->cancelled) break;
+            $this->db->beginTransaction();
+            try {
+                foreach ($posts as $post) {
+                    if ($this->cancelled) break;
 
-                $pageUrl = $wpReader->getPermalink($post);
-                if (isset($this->visitedUrls[$pageUrl])) continue;
-                $this->visitedUrls[$pageUrl] = true;
+                    $pageUrl = $wpReader->getPermalink($post);
+                    if (isset($this->visitedUrls[$pageUrl])) continue;
+                    $this->visitedUrls[$pageUrl] = true;
 
-                $publishedUrls[$this->normalizeForLookup($pageUrl)] = true;
+                    $publishedUrls[$this->normalizeForLookup($pageUrl)] = true;
 
-                $pageId = $this->savePageRecord($pageUrl, 200, 'text/html', 0, 0);
-                $pagesProcessed++;
+                    $pageId = $this->savePageRecord($pageUrl, 200, 'text/html', 0, 0);
+                    $pagesProcessed++;
 
-                $html = $wpReader->wrapContent($post['post_content']);
-                $extractedLinks = LinkExtractor::extract($html, $pageUrl, [
-                    'check_images' => (bool) $this->site['check_images'],
-                    'check_youtube' => (bool) $this->site['check_youtube'],
-                ]);
+                    $html = $wpReader->wrapContent($post['post_content']);
+                    $extractedLinks = LinkExtractor::extract($html, $pageUrl, [
+                        'check_images' => (bool) $this->site['check_images'],
+                        'check_youtube' => (bool) $this->site['check_youtube'],
+                    ]);
 
-                foreach ($extractedLinks as $link) {
-                    $targetUrl = $link['url'];
-                    if (empty($targetUrl)) continue;
+                    foreach ($extractedLinks as $link) {
+                        $targetUrl = $link['url'];
+                        if (empty($targetUrl)) continue;
 
-                    $isInternal = $this->isInternalUrl($targetUrl, $siteDomain);
-                    if (!$isInternal && !$this->site['crawl_external']) continue;
+                        $isInternal = $this->isInternalUrl($targetUrl, $siteDomain);
+                        if (!$isInternal && !$this->site['crawl_external']) continue;
 
-                    if (!isset($uniqueLinks[$targetUrl])) {
-                        $uniqueLinks[$targetUrl] = [
-                            'is_internal' => $isInternal,
+                        if (!isset($uniqueLinks[$targetUrl])) {
+                            $uniqueLinks[$targetUrl] = [
+                                'is_internal' => $isInternal,
+                                'type' => $link['type'],
+                                'sources' => [],
+                            ];
+                        }
+                        $uniqueLinks[$targetUrl]['sources'][] = [
+                            'page_id' => $pageId,
+                            'page_url' => $pageUrl,
+                            'text' => $link['text'],
                             'type' => $link['type'],
-                            'sources' => [],
                         ];
                     }
-                    $uniqueLinks[$targetUrl]['sources'][] = [
-                        'page_id' => $pageId,
-                        'page_url' => $pageUrl,
-                        'text' => $link['text'],
-                        'type' => $link['type'],
-                    ];
                 }
+                $this->db->commit();
+            } catch (\Throwable $e) {
+                $this->db->rollBack();
+                $this->log('error', 'Phase 1 batch write failed: ' . $e->getMessage());
+            }
 
-                if ($pagesProcessed % 200 === 0) {
-                    $this->updateProgress($pagesProcessed);
-                    $this->log('info', "Phase 1/3: {$pagesProcessed}/{$totalPosts} pages, " . count($uniqueLinks) . " unique links found");
+            $this->updateProgress($pagesProcessed);
+            $this->log('info', "Phase 1/3: {$pagesProcessed}/{$totalPosts} pages, " . count($uniqueLinks) . " unique links found");
 
-                    $stmt = $this->db->prepare("SELECT status FROM scans WHERE id = ?");
-                    $stmt->execute([$this->scanId]);
-                    if ($stmt->fetchColumn() === 'cancelled') {
-                        $this->cancelled = true;
-                        $this->log('info', 'Scan cancelled by user');
-                    }
-                }
+            $stmt = $this->db->prepare("SELECT status FROM scans WHERE id = ?");
+            $stmt->execute([$this->scanId]);
+            if ($stmt->fetchColumn() === 'cancelled') {
+                $this->cancelled = true;
+                $this->log('info', 'Scan cancelled by user');
             }
         }
 
@@ -365,34 +370,89 @@ class Scanner {
 
         if ($this->cancelled) return;
 
-        // ── PHASE 3: Check external links via HTTP ──
+        // ── PHASE 3: Check external links via HTTP (concurrent) ──
         $totalExternal = count($externalLinks);
         $this->log('info', "Phase 3/3: Checking {$totalExternal} external links via HTTP...");
 
         $checkedCount = 0;
+        $concurrency = max(10, $this->concurrentRequests);
 
+        $preChecked = [];
+        $httpCheckUrls = [];
         foreach ($externalLinks as $url => $info) {
-            if ($this->cancelled) break;
+            if ($this->isIgnored($url)) {
+                $preChecked[$url] = [
+                    'http_status' => null, 'status_category' => 'ignored',
+                    'response_time_ms' => null, 'final_url' => null,
+                    'redirect_count' => 0, 'block_type' => null,
+                    'error_message' => 'Ignored by rule',
+                ];
+                continue;
+            }
+            if (($info['type'] === 'youtube') && blc_is_youtube_url($url)) {
+                $ytResult = YouTubeChecker::check($url);
+                if ($ytResult['exists'] === true) {
+                    $preChecked[$url] = [
+                        'http_status' => 200, 'status_category' => 'ok',
+                        'response_time_ms' => null, 'final_url' => $url,
+                        'redirect_count' => 0, 'block_type' => null,
+                        'error_message' => null,
+                    ];
+                    continue;
+                } elseif ($ytResult['exists'] === false) {
+                    $preChecked[$url] = [
+                        'http_status' => 404, 'status_category' => 'broken',
+                        'response_time_ms' => null, 'final_url' => $url,
+                        'redirect_count' => 0, 'block_type' => null,
+                        'error_message' => $ytResult['error'] ?? 'Video not available',
+                    ];
+                    continue;
+                }
+            }
+            $httpCheckUrls[] = $url;
+        }
 
-            $result = $this->checkLink($url, $info['type']);
+        foreach ($preChecked as $url => $result) {
             $this->checkedTargets[$url] = $result;
-
-            foreach ($info['sources'] as $source) {
+            foreach ($externalLinks[$url]['sources'] as $source) {
                 $linksBuffer[] = $this->buildLinkRecord(
                     $source['page_id'], $source['page_url'], $url,
                     ['text' => $source['text'], 'type' => $source['type']],
                     false, $result
                 );
             }
-
             $checkedCount++;
+        }
+        if (count($linksBuffer) >= 500) {
+            $this->flushLinks($linksBuffer);
+            $linksBuffer = [];
+        }
+
+        $batches = array_chunk($httpCheckUrls, $concurrency);
+        foreach ($batches as $batch) {
+            if ($this->cancelled) break;
+
+            $batchResults = $this->checkUrlBatchConcurrent($batch);
+
+            foreach ($batchResults as $url => $result) {
+                $this->checkedTargets[$url] = $result;
+                foreach ($externalLinks[$url]['sources'] as $source) {
+                    $linksBuffer[] = $this->buildLinkRecord(
+                        $source['page_id'], $source['page_url'], $url,
+                        ['text' => $source['text'], 'type' => $source['type']],
+                        false, $result
+                    );
+                }
+            }
+
+            $checkedCount += count($batch);
             if (count($linksBuffer) >= 500) {
                 $this->flushLinks($linksBuffer);
                 $linksBuffer = [];
             }
 
-            if ($checkedCount % 50 === 0) {
-                $this->updateProgress($pagesProcessed);
+            $this->updateProgress($pagesProcessed);
+            if ($checkedCount % ($concurrency * 3) < $concurrency) {
                 $this->log('info', "Phase 3/3: {$checkedCount}/{$totalExternal} external links checked");
 
                 $stmt = $this->db->prepare("SELECT status FROM scans WHERE id = ?");
@@ -473,6 +533,175 @@ class Scanner {
         $url = preg_replace('/#.*$/', '', $url);
         $url = strtok($url, '?');
         return rtrim($url, '/');
+    }
+
+    private function checkUrlBatchConcurrent(array $urls): array {
+        $results = [];
+
+        $rawPass1 = $this->curlMultiBatch($urls, true, false);
+
+        $needGet = [];
+        $needRetry = [];
+
+        foreach ($rawPass1 as $url => $raw) {
+            $status = $raw['http_status'];
+
+            if ($raw['error']) {
+                if ($raw['is_timeout']) {
+                    $needRetry[] = $url;
+                } else {
+                    $results[$url] = [
+                        'http_status' => null, 'status_category' => 'broken',
+                        'response_time_ms' => $raw['response_time_ms'],
+                        'final_url' => $raw['final_url'], 'redirect_count' => 0,
+                        'block_type' => null,
+                        'error_message' => $raw['error'],
+                    ];
+                }
+            } elseif (in_array($status, [405, 501])) {
+                $needGet[] = $url;
+            } elseif ($status >= 200 && $status < 400) {
+                $results[$url] = [
+                    'http_status' => $status, 'status_category' => 'ok',
+                    'response_time_ms' => $raw['response_time_ms'],
+                    'final_url' => $raw['final_url'], 'redirect_count' => $raw['redirect_count'],
+                    'block_type' => null, 'error_message' => null,
+                ];
+            } elseif ($status === 404 || $status === 410) {
+                $results[$url] = [
+                    'http_status' => $status, 'status_category' => 'broken',
+                    'response_time_ms' => $raw['response_time_ms'],
+                    'final_url' => $raw['final_url'], 'redirect_count' => $raw['redirect_count'],
+                    'block_type' => null, 'error_message' => null,
+                ];
+            } elseif (in_array($status, [403, 429, 401]) || $status >= 500) {
+                $needRetry[] = $url;
+            } else {
+                $results[$url] = [
+                    'http_status' => $status, 'status_category' => 'warning',
+                    'response_time_ms' => $raw['response_time_ms'],
+                    'final_url' => $raw['final_url'], 'redirect_count' => $raw['redirect_count'],
+                    'block_type' => null,
+                    'error_message' => 'HTTP ' . $status,
+                ];
+            }
+        }
+
+        if (!empty($needGet)) {
+            $rawGet = $this->curlMultiBatch($needGet, false, false);
+            foreach ($rawGet as $url => $raw) {
+                $results[$url] = $this->classifyRawResult($raw, false);
+            }
+        }
+
+        if (!empty($needRetry)) {
+            $rawRetry = $this->curlMultiBatch($needRetry, false, true);
+            foreach ($rawRetry as $url => $raw) {
+                $results[$url] = $this->classifyRawResult($raw, true);
+            }
+        }
+
+        return $results;
+    }
+
+    private function curlMultiBatch(array $urls, bool $headOnly, bool $browserUa): array {
+        $mh = curl_multi_init();
+        $handles = [];
+
+        foreach ($urls as $url) {
+            $headers = $this->uaRotator->getHeaders($browserUa);
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL => $url,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_MAXREDIRS => 10,
+                CURLOPT_TIMEOUT => 15,
+                CURLOPT_CONNECTTIMEOUT => 8,
+                CURLOPT_SSL_VERIFYPEER => true,
+                CURLOPT_SSL_VERIFYHOST => 2,
+                CURLOPT_ENCODING => '',
+                CURLOPT_HTTPHEADER => $headers,
+            ]);
+            if ($headOnly) {
+                curl_setopt($ch, CURLOPT_NOBODY, true);
+            }
+            $handles[$url] = $ch;
+            curl_multi_add_handle($mh, $ch);
+        }
+
+        do {
+            $status = curl_multi_exec($mh, $active);
+            if ($active > 0) {
+                curl_multi_select($mh, 0.2);
+            }
+        } while ($active > 0 && $status === CURLM_OK);
+
+        $results = [];
+        foreach ($handles as $url => $ch) {
+            $errno = curl_errno($ch);
+            $results[$url] = [
+                'http_status' => $errno ? null : (int) curl_getinfo($ch, CURLINFO_HTTP_CODE),
+                'final_url' => curl_getinfo($ch, CURLINFO_EFFECTIVE_URL) ?: $url,
+                'redirect_count' => (int) curl_getinfo($ch, CURLINFO_REDIRECT_COUNT),
+                'response_time_ms' => (int) (curl_getinfo($ch, CURLINFO_TOTAL_TIME) * 1000),
+                'error' => $errno ? (curl_error($ch) ?: 'Connection failed') : null,
+                'is_timeout' => in_array($errno, [CURLE_OPERATION_TIMEDOUT, 28]),
+            ];
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+        }
+
+        curl_multi_close($mh);
+        return $results;
+    }
+
+    private function classifyRawResult(array $raw, bool $isRetry): array {
+        if ($raw['error']) {
+            return [
+                'http_status' => null,
+                'status_category' => $raw['is_timeout'] ? 'timeout' : 'broken',
+                'response_time_ms' => $raw['response_time_ms'],
+                'final_url' => $raw['final_url'], 'redirect_count' => $raw['redirect_count'],
+                'block_type' => null, 'error_message' => $raw['error'],
+            ];
+        }
+
+        $status = $raw['http_status'];
+
+        if ($status >= 200 && $status < 400) {
+            return [
+                'http_status' => $status, 'status_category' => 'ok',
+                'response_time_ms' => $raw['response_time_ms'],
+                'final_url' => $raw['final_url'], 'redirect_count' => $raw['redirect_count'],
+                'block_type' => $isRetry ? 'waf' : null, 'error_message' => null,
+            ];
+        }
+
+        if ($status === 404 || $status === 410) {
+            return [
+                'http_status' => $status, 'status_category' => 'broken',
+                'response_time_ms' => $raw['response_time_ms'],
+                'final_url' => $raw['final_url'], 'redirect_count' => $raw['redirect_count'],
+                'block_type' => null, 'error_message' => null,
+            ];
+        }
+
+        if (in_array($status, [403, 429, 401]) || $status >= 500) {
+            return [
+                'http_status' => $status, 'status_category' => 'blocked',
+                'response_time_ms' => $raw['response_time_ms'],
+                'final_url' => $raw['final_url'], 'redirect_count' => $raw['redirect_count'],
+                'block_type' => 'waf', 'error_message' => null,
+            ];
+        }
+
+        return [
+            'http_status' => $status, 'status_category' => 'warning',
+            'response_time_ms' => $raw['response_time_ms'],
+            'final_url' => $raw['final_url'], 'redirect_count' => $raw['redirect_count'],
+            'block_type' => null, 'error_message' => 'HTTP ' . $status,
+        ];
     }
 
     private function savePageRecord(string $url, int $httpStatus, string $contentType, int $responseTime, int $depth): int {
