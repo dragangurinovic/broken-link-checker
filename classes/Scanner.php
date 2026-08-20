@@ -239,9 +239,15 @@ class Scanner {
         $stmt->execute([$totalPosts, $this->scanId]);
 
         $siteDomain = blc_get_domain($this->site['url']);
-        $batchSize = 100;
+        $siteUrl = rtrim($this->site['url'], '/');
+
+        // ── PHASE 1: Extract all links from database (no HTTP) ──
+        $this->log('info', 'Phase 1/3: Extracting links from all posts...');
+
+        $publishedUrls = [];
+        $uniqueLinks = [];
+        $batchSize = 200;
         $pagesProcessed = 0;
-        $linksBuffer = [];
         $offset = 0;
 
         while (!$this->cancelled) {
@@ -256,9 +262,10 @@ class Scanner {
                 if (isset($this->visitedUrls[$pageUrl])) continue;
                 $this->visitedUrls[$pageUrl] = true;
 
+                $publishedUrls[$this->normalizeForLookup($pageUrl)] = true;
+
                 $pageId = $this->savePageRecord($pageUrl, 200, 'text/html', 0, 0);
                 $pagesProcessed++;
-                $this->updateProgress($pagesProcessed);
 
                 $html = $wpReader->wrapContent($post['post_content']);
                 $extractedLinks = LinkExtractor::extract($html, $pageUrl, [
@@ -273,24 +280,25 @@ class Scanner {
                     $isInternal = $this->isInternalUrl($targetUrl, $siteDomain);
                     if (!$isInternal && !$this->site['crawl_external']) continue;
 
-                    if (isset($this->checkedTargets[$targetUrl])) {
-                        $linksBuffer[] = $this->buildLinkRecord($pageId, $pageUrl, $targetUrl, $link, $isInternal, $this->checkedTargets[$targetUrl]);
-                    } else {
-                        $linkResult = $isInternal
-                            ? $this->checkInternalLinkViaDb($targetUrl, $wpReader)
-                            : $this->checkLink($targetUrl, $link['type']);
-                        $this->checkedTargets[$targetUrl] = $linkResult;
-                        $linksBuffer[] = $this->buildLinkRecord($pageId, $pageUrl, $targetUrl, $link, $isInternal, $linkResult);
+                    if (!isset($uniqueLinks[$targetUrl])) {
+                        $uniqueLinks[$targetUrl] = [
+                            'is_internal' => $isInternal,
+                            'type' => $link['type'],
+                            'sources' => [],
+                        ];
                     }
-
-                    if (count($linksBuffer) >= 50) {
-                        $this->flushLinks($linksBuffer);
-                        $linksBuffer = [];
-                    }
+                    $uniqueLinks[$targetUrl]['sources'][] = [
+                        'page_id' => $pageId,
+                        'page_url' => $pageUrl,
+                        'text' => $link['text'],
+                        'type' => $link['type'],
+                    ];
                 }
 
-                // Check for cancellation every 50 pages
-                if ($pagesProcessed % 50 === 0) {
+                if ($pagesProcessed % 200 === 0) {
+                    $this->updateProgress($pagesProcessed);
+                    $this->log('info', "Phase 1/3: {$pagesProcessed}/{$totalPosts} pages, " . count($uniqueLinks) . " unique links found");
+
                     $stmt = $this->db->prepare("SELECT status FROM scans WHERE id = ?");
                     $stmt->execute([$this->scanId]);
                     if ($stmt->fetchColumn() === 'cancelled') {
@@ -301,50 +309,170 @@ class Scanner {
             }
         }
 
+        $this->updateProgress($pagesProcessed);
+        $publishedUrls[$this->normalizeForLookup($siteUrl)] = true;
+        $publishedUrls[$this->normalizeForLookup($siteUrl . '/')] = true;
+
+        $internalLinks = [];
+        $externalLinks = [];
+        foreach ($uniqueLinks as $url => $info) {
+            if ($info['is_internal']) {
+                $internalLinks[$url] = $info;
+            } else {
+                $externalLinks[$url] = $info;
+            }
+        }
+        unset($uniqueLinks);
+
+        $this->log('info', "Phase 1/3 done: {$pagesProcessed} pages, " . count($internalLinks) . " internal + " . count($externalLinks) . " external unique links");
+
+        if ($this->cancelled) return;
+
+        // ── PHASE 2: Verify internal links via database (no HTTP) ──
+        $this->log('info', 'Phase 2/3: Verifying ' . count($internalLinks) . ' internal links via database...');
+
+        $linksBuffer = [];
+        $checkedCount = 0;
+
+        foreach ($internalLinks as $url => $info) {
+            if ($this->cancelled) break;
+
+            $result = $this->verifyInternalLink($url, $publishedUrls);
+            $this->checkedTargets[$url] = $result;
+
+            foreach ($info['sources'] as $source) {
+                $linksBuffer[] = $this->buildLinkRecord(
+                    $source['page_id'], $source['page_url'], $url,
+                    ['text' => $source['text'], 'type' => $source['type']],
+                    true, $result
+                );
+            }
+
+            $checkedCount++;
+            if (count($linksBuffer) >= 500) {
+                $this->flushLinks($linksBuffer);
+                $linksBuffer = [];
+            }
+        }
+
+        if (!empty($linksBuffer)) {
+            $this->flushLinks($linksBuffer);
+            $linksBuffer = [];
+        }
+
+        unset($internalLinks, $publishedUrls);
+        $this->log('info', "Phase 2/3 done: {$checkedCount} internal links verified (no HTTP)");
+
+        if ($this->cancelled) return;
+
+        // ── PHASE 3: Check external links via HTTP ──
+        $totalExternal = count($externalLinks);
+        $this->log('info', "Phase 3/3: Checking {$totalExternal} external links via HTTP...");
+
+        $checkedCount = 0;
+
+        foreach ($externalLinks as $url => $info) {
+            if ($this->cancelled) break;
+
+            $result = $this->checkLink($url, $info['type']);
+            $this->checkedTargets[$url] = $result;
+
+            foreach ($info['sources'] as $source) {
+                $linksBuffer[] = $this->buildLinkRecord(
+                    $source['page_id'], $source['page_url'], $url,
+                    ['text' => $source['text'], 'type' => $source['type']],
+                    false, $result
+                );
+            }
+
+            $checkedCount++;
+            if (count($linksBuffer) >= 500) {
+                $this->flushLinks($linksBuffer);
+                $linksBuffer = [];
+            }
+
+            if ($checkedCount % 50 === 0) {
+                $this->updateProgress($pagesProcessed);
+                $this->log('info', "Phase 3/3: {$checkedCount}/{$totalExternal} external links checked");
+
+                $stmt = $this->db->prepare("SELECT status FROM scans WHERE id = ?");
+                $stmt->execute([$this->scanId]);
+                if ($stmt->fetchColumn() === 'cancelled') {
+                    $this->cancelled = true;
+                    $this->log('info', 'Scan cancelled by user');
+                }
+            }
+        }
+
         if (!empty($linksBuffer)) {
             $this->flushLinks($linksBuffer);
         }
+
+        $this->log('info', "Phase 3/3 done: {$checkedCount} external links checked via HTTP");
     }
 
-    private function checkInternalLinkViaDb(string $url, WpDatabaseReader $wpReader): array {
+    private function verifyInternalLink(string $url, array $publishedUrls): array {
         if ($this->isIgnored($url)) {
-            return ['http_status' => null, 'status_category' => 'ignored', 'response_time_ms' => null, 'final_url' => null, 'redirect_count' => 0, 'block_type' => null, 'error_message' => 'Ignored by rule'];
+            return [
+                'http_status' => null, 'status_category' => 'ignored',
+                'response_time_ms' => null, 'final_url' => null,
+                'redirect_count' => 0, 'block_type' => null,
+                'error_message' => 'Ignored by rule',
+            ];
         }
 
-        // For internal links, do a lightweight HEAD request instead of a full GET.
-        // This is still HTTP but avoids rendering the full page — just checks existence.
-        $headers = $this->uaRotator->getHeaders(false);
-        $ch = curl_init();
-        curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_NOBODY => true,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 5,
-            CURLOPT_TIMEOUT => 10,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_HTTPHEADER => $headers,
-        ]);
+        $ok = [
+            'http_status' => 200, 'status_category' => 'ok',
+            'response_time_ms' => 0, 'final_url' => $url,
+            'redirect_count' => 0, 'block_type' => null,
+            'error_message' => null,
+        ];
 
-        curl_exec($ch);
-        $httpStatus = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $finalUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
-        $responseTime = (int) (curl_getinfo($ch, CURLINFO_TOTAL_TIME) * 1000);
-        $error = curl_error($ch);
-        $redirectCount = (int) curl_getinfo($ch, CURLINFO_REDIRECT_COUNT);
-        curl_close($ch);
+        $normalized = $this->normalizeForLookup($url);
+        if (isset($publishedUrls[$normalized])) {
+            return $ok;
+        }
 
-        if ($httpStatus === 0) {
-            return ['http_status' => null, 'status_category' => 'broken', 'response_time_ms' => $responseTime, 'final_url' => $finalUrl, 'redirect_count' => $redirectCount, 'block_type' => null, 'error_message' => $error ?: 'Connection failed'];
+        $path = parse_url($url, PHP_URL_PATH) ?: '/';
+
+        if (preg_match('#^/(wp-admin|wp-login|wp-includes|feed|xmlrpc|wp-json|wp-cron)#i', $path)) {
+            return $ok;
         }
-        if ($httpStatus >= 400) {
-            return ['http_status' => $httpStatus, 'status_category' => 'broken', 'response_time_ms' => $responseTime, 'final_url' => $finalUrl, 'redirect_count' => $redirectCount, 'block_type' => null, 'error_message' => null];
+
+        if (preg_match('#^/(category|tag|author|page|\d{4}/\d{2}(/\d{2})?)(/|$)#i', $path)) {
+            return $ok;
         }
-        if ($httpStatus >= 300) {
-            return ['http_status' => $httpStatus, 'status_category' => 'warning', 'response_time_ms' => $responseTime, 'final_url' => $finalUrl, 'redirect_count' => $redirectCount, 'block_type' => null, 'error_message' => null];
+
+        if (str_contains($path, '/wp-content/')) {
+            return $ok;
         }
-        return ['http_status' => $httpStatus, 'status_category' => 'ok', 'response_time_ms' => $responseTime, 'final_url' => $finalUrl, 'redirect_count' => $redirectCount, 'block_type' => null, 'error_message' => null];
+
+        if (preg_match('#\.(jpg|jpeg|png|gif|svg|webp|ico|pdf|css|js|woff2?|ttf|eot|mp[34]|zip|xml|txt|html?)(\?.*)?$#i', $path)) {
+            return $ok;
+        }
+
+        if ($path === '/' || $path === '') {
+            return $ok;
+        }
+
+        $urlNoQuery = strtok($url, '?');
+        $normNoQuery = $this->normalizeForLookup($urlNoQuery);
+        if (isset($publishedUrls[$normNoQuery])) {
+            return $ok;
+        }
+
+        return [
+            'http_status' => 404, 'status_category' => 'broken',
+            'response_time_ms' => 0, 'final_url' => $url,
+            'redirect_count' => 0, 'block_type' => null,
+            'error_message' => 'Not found in published content',
+        ];
+    }
+
+    private function normalizeForLookup(string $url): string {
+        $url = preg_replace('/#.*$/', '', $url);
+        $url = strtok($url, '?');
+        return rtrim($url, '/');
     }
 
     private function savePageRecord(string $url, int $httpStatus, string $contentType, int $responseTime, int $depth): int {
