@@ -188,10 +188,10 @@ class Scanner {
 
                 $isInternal = $this->isInternalUrl($targetUrl, $siteDomain);
 
-                // Queue internal pages for crawling
+                // Queue internal pages for crawling (skip archive pagination)
                 if ($isInternal && $this->site['crawl_internal'] && !isset($this->visitedUrls[$targetUrl])) {
                     $normalized = rtrim($targetUrl, '/');
-                    if (!isset($this->visitedUrls[$normalized])) {
+                    if (!isset($this->visitedUrls[$normalized]) && !$this->isArchivePagination($normalized)) {
                         $queue[] = ['url' => $normalized, 'depth' => $depth + 1];
                     }
                 }
@@ -333,24 +333,29 @@ class Scanner {
 
         if ($this->cancelled) return;
 
-        // ── PHASE 2: Verify internal links via database (no HTTP) ──
+        // ── PHASE 2: Verify internal links via database, fallback HTTP for uncertain ──
         $this->log('info', 'Phase 2/3: Verifying ' . count($internalLinks) . ' internal links via database...');
 
         $linksBuffer = [];
         $checkedCount = 0;
+        $uncertainLinks = [];
 
         foreach ($internalLinks as $url => $info) {
             if ($this->cancelled) break;
 
             $result = $this->verifyInternalLink($url, $publishedUrls);
-            $this->checkedTargets[$url] = $result;
 
-            foreach ($info['sources'] as $source) {
-                $linksBuffer[] = $this->buildLinkRecord(
-                    $source['page_id'], $source['page_url'], $url,
-                    ['text' => $source['text'], 'type' => $source['type']],
-                    true, $result
-                );
+            if ($result['error_message'] === 'Not found in published content') {
+                $uncertainLinks[$url] = $info;
+            } else {
+                $this->checkedTargets[$url] = $result;
+                foreach ($info['sources'] as $source) {
+                    $linksBuffer[] = $this->buildLinkRecord(
+                        $source['page_id'], $source['page_url'], $url,
+                        ['text' => $source['text'], 'type' => $source['type']],
+                        true, $result
+                    );
+                }
             }
 
             $checkedCount++;
@@ -365,8 +370,49 @@ class Scanner {
             $linksBuffer = [];
         }
 
-        unset($internalLinks, $publishedUrls);
-        $this->log('info', "Phase 2/3 done: {$checkedCount} internal links verified (no HTTP)");
+        $this->log('info', "Phase 2/3: {$checkedCount} checked via DB, " . count($uncertainLinks) . " uncertain — verifying via HTTP...");
+
+        if (!empty($uncertainLinks) && !$this->cancelled) {
+            $uncertainUrls = array_keys($uncertainLinks);
+            $batchSize = 5;
+            for ($i = 0; $i < count($uncertainUrls); $i += $batchSize) {
+                if ($this->cancelled) break;
+                $batch = array_slice($uncertainUrls, $i, $batchSize);
+                $httpResults = $this->curlMultiBatch($batch, true, false);
+
+                foreach ($httpResults as $url => $raw) {
+                    $result = $this->classifyRawResult($raw, false);
+                    if ($result['status_category'] === 'broken' || $result['http_status'] === 405) {
+                        $getResults = $this->curlMultiBatch([$url], false, false);
+                        if (isset($getResults[$url])) {
+                            $result = $this->classifyRawResult($getResults[$url], true);
+                        }
+                    }
+                    $this->checkedTargets[$url] = $result;
+                    $info = $uncertainLinks[$url];
+                    foreach ($info['sources'] as $source) {
+                        $linksBuffer[] = $this->buildLinkRecord(
+                            $source['page_id'], $source['page_url'], $url,
+                            ['text' => $source['text'], 'type' => $source['type']],
+                            true, $result
+                        );
+                    }
+                }
+
+                if (count($linksBuffer) >= 500) {
+                    $this->flushLinks($linksBuffer);
+                    $linksBuffer = [];
+                }
+            }
+        }
+
+        if (!empty($linksBuffer)) {
+            $this->flushLinks($linksBuffer);
+            $linksBuffer = [];
+        }
+
+        unset($internalLinks, $uncertainLinks, $publishedUrls);
+        $this->log('info', "Phase 2/3 done: {$checkedCount} internal links verified");
 
         if ($this->cancelled) return;
 
@@ -533,6 +579,11 @@ class Scanner {
         $url = preg_replace('/#.*$/', '', $url);
         $url = strtok($url, '?');
         return rtrim($url, '/');
+    }
+
+    private function isArchivePagination(string $url): bool {
+        $path = parse_url($url, PHP_URL_PATH) ?: '';
+        return (bool) preg_match('#/page/([2-9]|\d{2,})/?$#', $path);
     }
 
     private function checkUrlBatchConcurrent(array $urls): array {
