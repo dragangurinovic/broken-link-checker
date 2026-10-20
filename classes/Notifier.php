@@ -33,7 +33,7 @@ class Notifier {
     }
 
     private function sendEmail(array $scan, array $brokenLinks): void {
-        $to = Database::getSetting('notify_email_to');
+        $to = !empty($scan['notify_email']) ? $scan['notify_email'] : Database::getSetting('notify_email_to');
         if (empty($to)) return;
 
         $siteName = $scan['site_name'];

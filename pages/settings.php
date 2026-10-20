@@ -63,13 +63,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // Save database config per site
+    // Save database config and notification email per site
     if (isset($_POST['wpdb'])) {
         foreach ($_POST['wpdb'] as $siteId => $wpdb) {
             $dbName = trim($wpdb['name'] ?? '');
             $dbUser = trim($wpdb['user'] ?? '');
             $scanMode = (!empty($dbName) && !empty($dbUser)) ? 'database' : 'http';
-            $stmt = $db->prepare('UPDATE sites SET scan_mode = ?, wp_db_host = ?, wp_db_name = ?, wp_db_user = ?, wp_db_pass = ?, wp_table_prefix = ? WHERE id = ?');
+            $notifyEmail = trim($wpdb['notify_email'] ?? '');
+            $stmt = $db->prepare('UPDATE sites SET scan_mode = ?, wp_db_host = ?, wp_db_name = ?, wp_db_user = ?, wp_db_pass = ?, wp_table_prefix = ?, notify_email = ? WHERE id = ?');
             $stmt->execute([
                 $scanMode,
                 trim($wpdb['host'] ?? '') ?: 'localhost',
@@ -77,6 +78,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $dbUser,
                 $wpdb['pass'] ?? '',
                 trim($wpdb['prefix'] ?? '') ?: 'wp_',
+                $notifyEmail ?: null,
                 $siteId,
             ]);
         }
@@ -307,6 +309,11 @@ $sites = $db->query("SELECT s.*, ss.frequency, ss.day_of_week, ss.day_of_month, 
                         <label class="form-label">Table Prefix</label>
                         <input type="text" name="wpdb[<?= $s['id'] ?>][prefix]" class="form-control" value="<?= htmlspecialchars($s['wp_table_prefix'] ?? 'wp_') ?>" placeholder="wp_">
                     </div>
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label class="form-label">Report Email</label>
+                    <input type="text" name="wpdb[<?= $s['id'] ?>][notify_email]" class="form-control" value="<?= htmlspecialchars($s['notify_email'] ?? '') ?>" placeholder="person@example.com, team@example.com">
+                    <div class="form-hint">Send broken link reports to these addresses. Leave empty to use the global notification email.</div>
                 </div>
                 <div style="margin-top: 8px;">
                     <button type="button" class="btn btn-outline btn-sm" onclick="testWpDb(<?= $s['id'] ?>)">Test Connection</button>
