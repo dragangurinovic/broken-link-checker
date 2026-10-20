@@ -19,7 +19,7 @@ class Notifier {
         $onlyIfBroken = Database::getSetting('notify_only_if_broken') === '1';
         if ($onlyIfBroken && $scan['links_broken'] == 0) return;
 
-        $brokenLinks = $this->db->prepare('SELECT source_url, target_url, http_status, status_category, link_text, link_type, error_message FROM links WHERE scan_id = ? AND status_category IN (\'broken\', \'warning\', \'blocked\') ORDER BY status_category ASC, http_status ASC LIMIT 25');
+        $brokenLinks = $this->db->prepare('SELECT source_url, target_url, http_status, status_category, link_text, link_type, error_message FROM links WHERE scan_id = ? AND status_category IN (\'broken\', \'warning\', \'blocked\') ORDER BY status_category ASC, http_status ASC');
         $brokenLinks->execute([$scanId]);
         $brokenLinks = $brokenLinks->fetchAll();
 
@@ -49,45 +49,73 @@ class Notifier {
             $subject .= "All links OK";
         }
 
-        $body = "Broken Link Checker Report\n";
-        $body .= "========================\n\n";
-        $body .= "Site: {$siteName} ({$scan['site_url']})\n";
-        $body .= "Health Score: {$health}/100\n";
-        $body .= "Pages Crawled: {$scan['pages_crawled']}\n";
-        $body .= "Links Checked: {$total}\n";
-        $body .= "Broken: {$broken}\n";
-        $body .= "Warnings: {$warnings}\n";
-        $body .= "Duration: " . ($scan['duration_secs'] ? gmdate('H:i:s', $scan['duration_secs']) : 'N/A') . "\n\n";
+        $textBody = "Broken Link Checker Report\n";
+        $textBody .= "========================\n\n";
+        $textBody .= "Site: {$siteName} ({$scan['site_url']})\n";
+        $textBody .= "Health Score: {$health}/100\n";
+        $textBody .= "Pages Crawled: {$scan['pages_crawled']}\n";
+        $textBody .= "Links Checked: {$total}\n";
+        $textBody .= "Broken: {$broken}\n";
+        $textBody .= "Warnings: {$warnings}\n";
+        $textBody .= "Duration: " . ($scan['duration_secs'] ? gmdate('H:i:s', $scan['duration_secs']) : 'N/A') . "\n\n";
 
-        if (!empty($brokenLinks)) {
-            $body .= "Broken Links:\n";
-            $body .= str_repeat('-', 60) . "\n\n";
-
-            foreach ($brokenLinks as $i => $link) {
-                $num = $i + 1;
-                $body .= "{$num}. [{$link['status_category']}] {$link['target_url']}\n";
-                $body .= "   Status: HTTP {$link['http_status']}\n";
-                $body .= "   Found on: {$link['source_url']}\n";
-                if (!empty($link['link_text'])) {
-                    $body .= "   Anchor: {$link['link_text']}\n";
-                }
-                if (!empty($link['error_message'])) {
-                    $body .= "   Error: {$link['error_message']}\n";
-                }
-                $body .= "\n";
-            }
+        if ($broken > 0) {
+            $textBody .= "See the attached CSV spreadsheet for the full list of broken links.\n\n";
         }
 
-        $body .= "\nFull report: " . BLC_APP_URL . "?page=site-detail&site_id={$scan['site_id']}\n";
+        $textBody .= "Full report: " . BLC_APP_URL . "?page=site-detail&site_id={$scan['site_id']}\n";
+
+        $boundary = md5(uniqid(time()));
 
         $headers = "From: Broken Link Checker <noreply@investor.fm>\r\n";
-        $headers .= "Content-Type: text/plain; charset=UTF-8\r\n";
+        $headers .= "MIME-Version: 1.0\r\n";
+
+        if (!empty($brokenLinks)) {
+            $headers .= "Content-Type: multipart/mixed; boundary=\"{$boundary}\"\r\n";
+
+            $csvData = $this->buildBrokenLinksCsv($brokenLinks, $siteName);
+            $csvFilename = 'broken-links-' . preg_replace('/[^a-z0-9]+/i', '-', $siteName) . '-' . date('Y-m-d') . '.csv';
+
+            $body = "--{$boundary}\r\n";
+            $body .= "Content-Type: text/plain; charset=UTF-8\r\n";
+            $body .= "Content-Transfer-Encoding: 7bit\r\n\r\n";
+            $body .= $textBody . "\r\n";
+            $body .= "--{$boundary}\r\n";
+            $body .= "Content-Type: text/csv; charset=UTF-8; name=\"{$csvFilename}\"\r\n";
+            $body .= "Content-Disposition: attachment; filename=\"{$csvFilename}\"\r\n";
+            $body .= "Content-Transfer-Encoding: base64\r\n\r\n";
+            $body .= chunk_split(base64_encode($csvData)) . "\r\n";
+            $body .= "--{$boundary}--\r\n";
+        } else {
+            $headers .= "Content-Type: text/plain; charset=UTF-8\r\n";
+            $body = $textBody;
+        }
 
         $emails = array_map('trim', explode(',', $to));
         foreach ($emails as $email) {
             $sent = mail($email, $subject, $body, $headers);
             $this->logNotification($scan['id'], 'email', $email, $subject, $sent);
         }
+    }
+
+    private function buildBrokenLinksCsv(array $brokenLinks, string $siteName): string {
+        $out = fopen('php://temp', 'r+');
+        fputcsv($out, ['Source Page', 'Broken URL', 'HTTP Status', 'Status', 'Anchor Text', 'Link Type', 'Error']);
+        foreach ($brokenLinks as $link) {
+            fputcsv($out, [
+                $link['source_url'],
+                $link['target_url'],
+                $link['http_status'] ?? '',
+                $link['status_category'],
+                $link['link_text'] ?? '',
+                $link['link_type'],
+                $link['error_message'] ?? '',
+            ]);
+        }
+        rewind($out);
+        $csv = stream_get_contents($out);
+        fclose($out);
+        return $csv;
     }
 
     private function sendSlack(array $scan, array $brokenLinks): void {

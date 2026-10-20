@@ -130,7 +130,7 @@ $scanHistory = $scanHistory->fetchAll();
             <button class="btn btn-primary" onclick="BLC.startScan(<?= $siteId ?>)">Scan Now</button>
         <?php endif; ?>
         <?php if ($scanId): ?>
-            <a href="api/export.php?site_id=<?= $siteId ?>&scan_id=<?= $scanId ?>" class="btn btn-outline">Export CSV</a>
+            <button class="btn btn-outline" onclick="document.getElementById('export-modal').style.display='flex'">Export CSV</button>
         <?php endif; ?>
     </div>
 </div>
@@ -355,4 +355,66 @@ $scanHistory = $scanHistory->fetchAll();
         </table>
     </div>
 </div>
+<?php endif; ?>
+
+<?php if ($scanId): ?>
+<!-- Export Modal -->
+<div id="export-modal" style="display:none; position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,0.4); align-items:center; justify-content:center;">
+    <div style="background:var(--white, #fff); border-radius:12px; padding:24px; width:380px; max-width:90vw; box-shadow:0 20px 60px rgba(0,0,0,0.2);">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px;">
+            <h3 style="font-size:16px; font-weight:700; margin:0;">Export Report</h3>
+            <button onclick="document.getElementById('export-modal').style.display='none'" style="background:none; border:none; font-size:20px; cursor:pointer; color:var(--gray-400); padding:0; line-height:1;">&times;</button>
+        </div>
+        <p style="font-size:13px; color:var(--gray-600); margin-bottom:16px;">Select which links to include in the CSV export:</p>
+        <div style="display:flex; flex-direction:column; gap:10px; margin-bottom:20px;">
+            <label style="display:flex; align-items:center; gap:8px; font-size:14px; cursor:pointer;">
+                <input type="checkbox" id="exp-broken" checked> Broken
+                <span style="font-size:12px; color:var(--gray-400);">(<?= $statusCounts['broken'] ?? 0 ?>)</span>
+            </label>
+            <label style="display:flex; align-items:center; gap:8px; font-size:14px; cursor:pointer;">
+                <input type="checkbox" id="exp-warning" checked> Warning
+                <span style="font-size:12px; color:var(--gray-400);">(<?= $statusCounts['warning'] ?? 0 ?>)</span>
+            </label>
+            <label style="display:flex; align-items:center; gap:8px; font-size:14px; cursor:pointer;">
+                <input type="checkbox" id="exp-blocked" checked> Blocked
+                <span style="font-size:12px; color:var(--gray-400);">(<?= $statusCounts['blocked'] ?? 0 ?>)</span>
+            </label>
+            <label style="display:flex; align-items:center; gap:8px; font-size:14px; cursor:pointer;">
+                <input type="checkbox" id="exp-timeout"> Timeout
+                <span style="font-size:12px; color:var(--gray-400);">(<?= $statusCounts['timeout'] ?? 0 ?>)</span>
+            </label>
+            <label style="display:flex; align-items:center; gap:8px; font-size:14px; cursor:pointer;">
+                <input type="checkbox" id="exp-ok"> OK
+                <span style="font-size:12px; color:var(--gray-400);">(<?= $statusCounts['ok'] ?? 0 ?>)</span>
+            </label>
+            <label style="display:flex; align-items:center; gap:8px; font-size:14px; cursor:pointer;">
+                <input type="checkbox" id="exp-ignored"> Ignored
+                <span style="font-size:12px; color:var(--gray-400);">(<?= $statusCounts['ignored'] ?? 0 ?>)</span>
+            </label>
+        </div>
+        <div style="display:flex; gap:8px; margin-bottom:12px;">
+            <button class="btn btn-sm btn-outline" onclick="document.querySelectorAll('#export-modal input[type=checkbox]').forEach(c=>c.checked=true)">Select All</button>
+            <button class="btn btn-sm btn-outline" onclick="document.querySelectorAll('#export-modal input[type=checkbox]').forEach(c=>c.checked=false)">Clear All</button>
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+            <button class="btn btn-outline" onclick="document.getElementById('export-modal').style.display='none'">Cancel</button>
+            <button class="btn btn-primary" onclick="blcExport()">Download CSV</button>
+        </div>
+    </div>
+</div>
+<script>
+function blcExport() {
+    var statuses = [];
+    if (document.getElementById('exp-broken').checked) statuses.push('broken');
+    if (document.getElementById('exp-warning').checked) statuses.push('warning');
+    if (document.getElementById('exp-blocked').checked) statuses.push('blocked');
+    if (document.getElementById('exp-timeout').checked) statuses.push('timeout');
+    if (document.getElementById('exp-ok').checked) statuses.push('ok');
+    if (document.getElementById('exp-ignored').checked) statuses.push('ignored');
+    if (statuses.length === 0) { alert('Select at least one status to export.'); return; }
+    var url = 'api/export.php?site_id=<?= $siteId ?>&scan_id=<?= $scanId ?>&status=' + statuses.join(',');
+    window.location.href = url;
+    document.getElementById('export-modal').style.display = 'none';
+}
+</script>
 <?php endif; ?>

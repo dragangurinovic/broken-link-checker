@@ -11,10 +11,16 @@ require_once BLC_ROOT . '/classes/CsvExporter.php';
 
 blc_require_auth_api();
 
+$statusParam = $_GET['status'] ?? null;
+$statusCategories = null;
+if ($statusParam) {
+    $statusCategories = array_map('trim', explode(',', $statusParam));
+}
+
 $filters = [
     'scan_id' => $_GET['scan_id'] ?? null,
     'site_id' => $_GET['site_id'] ?? null,
-    'status_category' => $_GET['status'] ?? null,
+    'status_category' => $statusCategories,
 ];
 
 $db = Database::getInstance();
