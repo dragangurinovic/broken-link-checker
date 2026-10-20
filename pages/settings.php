@@ -245,7 +245,21 @@ $sites = $db->query("SELECT s.*, ss.frequency, ss.day_of_week, ss.day_of_month, 
                                 <input type="time" name="schedule[<?= $site['id'] ?>][hour]" class="form-control" style="width:auto;" value="<?= sprintf('%02d:%02d', $site['hour'] ?? 2, $site['minute'] ?? 0) ?>">
                             </td>
                             <td style="font-size: 12px; color: var(--gray-500);">
-                                <?= $site['next_run_at'] ? blc_time_ago($site['next_run_at']) : 'Not scheduled' ?>
+                                <?php
+                                if (!$site['next_run_at']) {
+                                    echo 'Not scheduled';
+                                } else {
+                                    $nextUtc = new DateTime($site['next_run_at'], new DateTimeZone('UTC'));
+                                    $nextLocal = clone $nextUtc;
+                                    $nextLocal->setTimezone(new DateTimeZone(BLC_TIMEZONE));
+                                    $now = new DateTime('now', new DateTimeZone('UTC'));
+                                    if ($nextUtc <= $now) {
+                                        echo '<span style="color: var(--danger);">Overdue (' . $nextLocal->format('M j, g:i A') . ')</span>';
+                                    } else {
+                                        echo $nextLocal->format('M j, g:i A');
+                                    }
+                                }
+                                ?>
                             </td>
                         </tr>
                     <?php endforeach; ?>
@@ -306,9 +320,19 @@ $sites = $db->query("SELECT s.*, ss.frequency, ss.day_of_week, ss.day_of_month, 
     <div class="card" style="margin-bottom: 24px;">
         <div class="card-header"><h3>Cron Setup</h3></div>
         <div class="card-body">
-            <p style="font-size: 13px; color: var(--gray-600); margin-bottom: 12px;">Add this cron job to your server (via cPanel or command line):</p>
-            <pre style="background: var(--gray-100); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto;">*/5 * * * * /usr/bin/php <?= htmlspecialchars(BLC_ROOT) ?>/cron/run-scheduled.php >> <?= htmlspecialchars(BLC_ROOT) ?>/data/logs/scanner.log 2>&1</pre>
-            <div class="form-hint" style="margin-top: 8px;">This checks for due scans every 5 minutes and launches them in the background.</div>
+            <?php
+            $cronToken = Database::getSetting('cron_token', '');
+            if (empty($cronToken)) {
+                $cronToken = bin2hex(random_bytes(24));
+                Database::setSetting('cron_token', $cronToken);
+            }
+            ?>
+            <p style="font-size: 13px; color: var(--gray-600); margin-bottom: 12px;">Add one of these cron jobs to your server (via cPanel &gt; Cron Jobs). Run every 5 minutes:</p>
+            <p style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">Option 1 — PHP CLI (recommended):</p>
+            <pre style="background: var(--gray-100); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto; margin-bottom: 12px;">*/5 * * * * /usr/bin/php <?= htmlspecialchars(BLC_ROOT) ?>/cron/run-scheduled.php >> <?= htmlspecialchars(BLC_ROOT) ?>/data/logs/scanner.log 2>&1</pre>
+            <p style="font-size: 12px; font-weight: 600; margin-bottom: 4px;">Option 2 — wget (if PHP CLI path doesn't work on cPanel):</p>
+            <pre style="background: var(--gray-100); padding: 12px; border-radius: 6px; font-size: 12px; overflow-x: auto; margin-bottom: 12px;">*/5 * * * * wget -q -O /dev/null "<?= htmlspecialchars(BLC_APP_URL) ?>api/cron.php?token=<?= htmlspecialchars($cronToken) ?>"</pre>
+            <div class="form-hint" style="margin-top: 8px;">Both options check for due scans every 5 minutes and launch them in the background. If you see "CLI only" errors in the log, switch to Option 2.</div>
         </div>
     </div>
 
